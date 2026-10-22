@@ -5,6 +5,56 @@
 #include <climits>
 #include <cstdint>
 
+// RDNA2 / RDNA3 Q4_K / Q5_K / Q6_K (from llama.cpp-rdna2): the dot bodies copy their q8_1 activation window out of
+// shared memory with 16-byte loads (mmq-vec-dot.cuh), and the shared memory is declared 16-byte aligned.  Off unless
+// the build defines the macro of the type for the template-instance source file
+// (GGML_HIP_RDNA2_Q4_K_MMQ_WIDE_LDS=1 on mmq-instance-q4_k.cu, and so on).
+#ifndef GGML_HIP_RDNA2_Q4_K_MMQ_WIDE_LDS
+#define GGML_HIP_RDNA2_Q4_K_MMQ_WIDE_LDS 0
+#endif
+#ifndef GGML_HIP_RDNA2_Q5_K_MMQ_WIDE_LDS
+#define GGML_HIP_RDNA2_Q5_K_MMQ_WIDE_LDS 0
+#endif
+#ifndef GGML_HIP_RDNA2_Q6_K_MMQ_WIDE_LDS
+#define GGML_HIP_RDNA2_Q6_K_MMQ_WIDE_LDS 0
+#endif
+#ifndef GGML_HIP_RDNA3_Q4_K_MMQ_WIDE_LDS
+#define GGML_HIP_RDNA3_Q4_K_MMQ_WIDE_LDS 0
+#endif
+#ifndef GGML_HIP_RDNA3_Q5_K_MMQ_WIDE_LDS
+#define GGML_HIP_RDNA3_Q5_K_MMQ_WIDE_LDS 0
+#endif
+#ifndef GGML_HIP_RDNA3_Q6_K_MMQ_WIDE_LDS
+#define GGML_HIP_RDNA3_Q6_K_MMQ_WIDE_LDS 0
+#endif
+#if defined(RDNA2)
+#define GGML_HIP_RDNA_WIDE_LDS_Q4_K GGML_HIP_RDNA2_Q4_K_MMQ_WIDE_LDS
+#define GGML_HIP_RDNA_WIDE_LDS_Q5_K GGML_HIP_RDNA2_Q5_K_MMQ_WIDE_LDS
+#define GGML_HIP_RDNA_WIDE_LDS_Q6_K GGML_HIP_RDNA2_Q6_K_MMQ_WIDE_LDS
+#elif defined(RDNA3)
+#define GGML_HIP_RDNA_WIDE_LDS_Q4_K GGML_HIP_RDNA3_Q4_K_MMQ_WIDE_LDS
+#define GGML_HIP_RDNA_WIDE_LDS_Q5_K GGML_HIP_RDNA3_Q5_K_MMQ_WIDE_LDS
+#define GGML_HIP_RDNA_WIDE_LDS_Q6_K GGML_HIP_RDNA3_Q6_K_MMQ_WIDE_LDS
+#else
+#define GGML_HIP_RDNA_WIDE_LDS_Q4_K 0
+#define GGML_HIP_RDNA_WIDE_LDS_Q5_K 0
+#define GGML_HIP_RDNA_WIDE_LDS_Q6_K 0
+#endif
+
+// Tiles narrower than this keep the stock declaration and loads.  Measured on gfx1030 (Radeon PRO V620) with the
+// aligned ones at every J, as llama.cpp-rdna2 has them: J = 16 was 2-4% slower for Q5_K and Q6_K, J = 8 and 24 no
+// faster, J = 32 to 48 1-12% faster, J = 64 12-19% faster.  Q5_K's window stays at J >= 64 as there.
+#ifndef GGML_HIP_RDNA_WIDE_LDS_MIN_J
+#define GGML_HIP_RDNA_WIDE_LDS_MIN_J 32
+#endif
+
+// The switches change the device code only (RDNA2 / RDNA3 are defined in the device pass, not the host pass).  A
+// compiler cache that keys on the host pass's preprocessed text (ccache) would hand back the object built with the
+// other setting, so the setting is also written into that text here.
+[[maybe_unused]] static constexpr int ggml_hip_mmq_wide_lds_switches = (GGML_HIP_RDNA_WIDE_LDS_MIN_J << 6) |
+    (GGML_HIP_RDNA2_Q4_K_MMQ_WIDE_LDS << 0) | (GGML_HIP_RDNA2_Q5_K_MMQ_WIDE_LDS << 1) | (GGML_HIP_RDNA2_Q6_K_MMQ_WIDE_LDS << 2) |
+    (GGML_HIP_RDNA3_Q4_K_MMQ_WIDE_LDS << 3) | (GGML_HIP_RDNA3_Q5_K_MMQ_WIDE_LDS << 4) | (GGML_HIP_RDNA3_Q6_K_MMQ_WIDE_LDS << 5);
+
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
 #define MMQ_ITER_K             256
 #define MMQ_ITER_K_FP4         512
@@ -887,7 +937,18 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr ggml_cuda_mmq_vec_dot_t    vec_dot    = ggml_cuda_mmq_get_vec_dot<type, J, fallback>();
     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback>();
 
+#if defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3)) && (GGML_HIP_RDNA_WIDE_LDS_Q4_K || GGML_HIP_RDNA_WIDE_LDS_Q5_K || GGML_HIP_RDNA_WIDE_LDS_Q6_K)
+    int * data_mul_mat_q;
+    if constexpr (J >= GGML_HIP_RDNA_WIDE_LDS_MIN_J) {
+        extern __shared__ int4 data_mul_mat_q_aligned[]; // 16-byte aligned: the wide activation loads
+        data_mul_mat_q = reinterpret_cast<int *>(data_mul_mat_q_aligned);
+    } else {
+        extern __shared__ int data_mul_mat_q_stock[];
+        data_mul_mat_q = data_mul_mat_q_stock;
+    }
+#else
     extern __shared__ int data_mul_mat_q[];
+#endif
     int * tile_y = data_mul_mat_q + J;
     int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
@@ -950,6 +1011,15 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
+// Strata (third_party/llama.cpp-patches 0003): the channels' (a MoE launch's experts') weight matrices need not lie
+// stride_channel_x blocks apart.  With n > 0, channel c's matrix starts at p[c] (c < n <= MMQ_X_EACH_MAX) and `x` and
+// stride_channel_x are not read; n == 0 is the stock addressing.  The same blocks are read either way.
+#define MMQ_X_EACH_MAX 16
+struct mmq_x_each {
+    const char * p[MMQ_X_EACH_MAX];
+    int n;
+};
+
 template <ggml_type type, int J, bool fallback>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
 static __global__ void mul_mat_q(
@@ -959,7 +1029,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const mmq_x_each x_each) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -977,7 +1047,18 @@ static __global__ void mul_mat_q(
     // Initialize the ids for writing back data with just the index.
     // For regular matrix multiplications this is never changed.
     // For MoE the correct indices are loaded from ids_dst.
+#if defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3)) && (GGML_HIP_RDNA_WIDE_LDS_Q4_K || GGML_HIP_RDNA_WIDE_LDS_Q5_K || GGML_HIP_RDNA_WIDE_LDS_Q6_K)
+    int * ids_dst_shared; // Stored at beginning of shared memory.
+    if constexpr (J >= GGML_HIP_RDNA_WIDE_LDS_MIN_J) {
+        extern __shared__ int4 ids_dst_shared_aligned[];
+        ids_dst_shared = reinterpret_cast<int *>(ids_dst_shared_aligned);
+    } else {
+        extern __shared__ int ids_dst_shared_stock[];
+        ids_dst_shared = ids_dst_shared_stock;
+    }
+#else
     extern __shared__ int ids_dst_shared[]; // Stored at beginning of shared memory.
+#endif
 #pragma unroll
     for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
         const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
@@ -1050,11 +1131,13 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*I - 1;
         const int tile_y_max_j = col_diff - jt*J - 1;
 
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+        const char * x_z   = x_each.n > 0 ? x_each.p[fastdiv(zt, channel_ratio)] : x;
+        const int offset_x = x_each.n > 0 ? it*I*stride_row_x
+                           : fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, J, fallback, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+            (x_z, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
         return;
@@ -1144,11 +1227,13 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*I - 1;
         const int tile_y_max_j = col_diff - jt*J - 1;
 
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+        const char * x_z   = x_each.n > 0 ? x_each.p[fastdiv(zt, channel_ratio)] : x;
+        const int offset_x = x_each.n > 0 ? it*I*stride_row_x
+                           : fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, J, fallback, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+            (x_z, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 
@@ -1228,11 +1313,13 @@ static __global__ void mul_mat_q(
     const int tile_x_max_i = nrows_x  - it*I - 1;
     const int tile_y_max_j = col_diff - jt*J - 1;
 
-    const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+    const char * x_z   = x_each.n > 0 ? x_each.p[fastdiv(zt, channel_ratio)] : x;
+    const int offset_x = x_each.n > 0 ? it*I*stride_row_x
+                       : fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, J, fallback, fixup>
-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+        (x_z, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
          stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
@@ -1383,6 +1470,7 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
+    mmq_x_each x_each; // Strata (patch 0003): per-channel weight pointers, n == 0: none
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1432,7 +1520,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, args.x_each);
         return;
     }
 
@@ -1461,7 +1549,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, args.x_each);
 
     if (!fixup_needed) {
         return;

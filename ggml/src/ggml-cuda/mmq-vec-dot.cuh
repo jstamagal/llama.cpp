@@ -7,6 +7,11 @@ using namespace ggml_cuda_mma;
 
 #include "mmq.cuh"
 
+// RDNA Q4_K/Q5_K/Q6_K MMQ paths load their Q8_1 LDS input windows into a
+// 16-byte-aligned local array with vectorized LDS reads. The format-specific
+// macros are defined by mmq.cuh and the HIP template-instance CMake rules.
+// Q4_K / Q6_K: tiles of J >= GGML_HIP_RDNA_WIDE_LDS_MIN_J columns; Q5_K: J >= 64.
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -929,8 +934,29 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
                 const uint8_t * sc = (const uint8_t *) &x_sc[i * (MMQ_TILE_NE_K/8) + i/8 + k0/32] + 2*(k01/16);
 
+#if defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3)) && GGML_HIP_RDNA_WIDE_LDS_Q4_K
+                constexpr int max_cpy = ggml_cuda_get_max_cpy_bytes();
+                constexpr int mcpy_int = max_cpy / sizeof(int);
+                constexpr int u_ints = QR4_K * VDR_Q4_K_Q8_1_MMQ;
+                static_assert(max_cpy == 16 && u_ints == 16 && J % mcpy_int == 0,
+                              "unexpected Q4_K MMQ LDS window alignment");
+
+                alignas(16) int u[u_ints];
+                const int * u_qs = &y_qs[j*MMQ_TILE_Y_K + k01];
+                if constexpr (J >= GGML_HIP_RDNA_WIDE_LDS_MIN_J) {
+#pragma unroll
+                    for (int l0 = 0; l0 < u_ints / mcpy_int; ++l0) {
+                        ggml_cuda_memcpy_1<max_cpy>(u + l0 * mcpy_int,
+                                                     &y_qs[j*MMQ_TILE_Y_K + k01 + l0 * mcpy_int]);
+                    }
+                    u_qs = u;
+                }
+#else
+                const int * u_qs = &y_qs[j*MMQ_TILE_Y_K + k01];
+#endif
+
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q4_K_q8_1_impl_mmq(
-                    &x_qs[i*(MMQ_TILE_NE_K + 1) + k0/2], &y_qs[j*MMQ_TILE_Y_K + k01], sc, sc+8,
+                    &x_qs[i*(MMQ_TILE_NE_K + 1) + k0/2], u_qs, sc, sc+8,
                     x_dm[i], &y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
             }
         }
@@ -964,9 +990,33 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
                 const uint8_t * sc = ((const uint8_t *) &x_sc[i * (MMQ_TILE_NE_K/8) + i/8 + k00/32]) + 2*(k01/16);
 
-                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q5_K_q8_1_impl_mmq(
-                    &x_qs[i*(QR5_K*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01], sc, sc+8,
-                    x_dm[i], &y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+#if defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3)) && GGML_HIP_RDNA_WIDE_LDS_Q5_K
+                // Q5_K loses slightly for J=32 but wins substantially at the
+                // J=64 MMQ tile used by larger prompt/prefill batches.
+                static_assert(GGML_HIP_RDNA_WIDE_LDS_MIN_J <= 64, "the Q5_K window needs the aligned shared memory");
+                if constexpr (J >= 64) {
+                    constexpr int max_cpy = ggml_cuda_get_max_cpy_bytes();
+                    constexpr int mcpy_int = max_cpy / sizeof(int);
+                    constexpr int u_ints = QR5_K * VDR_Q5_K_Q8_1_MMQ;
+                    static_assert(max_cpy == 16 && u_ints == 16 && J % mcpy_int == 0,
+                                  "unexpected Q5_K MMQ LDS window alignment");
+
+                    alignas(16) int u[u_ints];
+#pragma unroll
+                    for (int l0 = 0; l0 < u_ints / mcpy_int; ++l0) {
+                        ggml_cuda_memcpy_1<max_cpy>(u + l0 * mcpy_int,
+                                                     &y_qs[j*MMQ_TILE_Y_K + k01 + l0 * mcpy_int]);
+                    }
+                    sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q5_K_q8_1_impl_mmq(
+                        &x_qs[i*(QR5_K*MMQ_TILE_NE_K + 1) + k0], u, sc, sc+8,
+                        x_dm[i], &y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                } else
+#endif
+                {
+                    sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q5_K_q8_1_impl_mmq(
+                        &x_qs[i*(QR5_K*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01], sc, sc+8,
+                        x_dm[i], &y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                }
             }
         }
     }
@@ -999,8 +1049,29 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
                 const int8_t * sc = ((const int8_t *) &x_sc[i * (MMQ_TILE_NE_K/8) + i/8 + k0/16]);
 
+#if defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3)) && GGML_HIP_RDNA_WIDE_LDS_Q6_K
+                constexpr int max_cpy = ggml_cuda_get_max_cpy_bytes();
+                constexpr int mcpy_int = max_cpy / sizeof(int);
+                constexpr int u_ints = QR6_K * VDR_Q6_K_Q8_1_MMQ;
+                static_assert(max_cpy == 16 && u_ints == 16 && J % mcpy_int == 0,
+                              "unexpected Q6_K MMQ LDS window alignment");
+
+                alignas(16) int u[u_ints];
+                const int * u_qs = &y_qs[j*MMQ_TILE_Y_K + k01];
+                if constexpr (J >= GGML_HIP_RDNA_WIDE_LDS_MIN_J) {
+#pragma unroll
+                    for (int l0 = 0; l0 < u_ints / mcpy_int; ++l0) {
+                        ggml_cuda_memcpy_1<max_cpy>(u + l0 * mcpy_int,
+                                                     &y_qs[j*MMQ_TILE_Y_K + k01 + l0 * mcpy_int]);
+                    }
+                    u_qs = u;
+                }
+#else
+                const int * u_qs = &y_qs[j*MMQ_TILE_Y_K + k01];
+#endif
+
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q6_K_q8_1_impl_mmq(
-                    &x_qs[i*(QR6_K*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01], sc,
+                    &x_qs[i*(QR6_K*MMQ_TILE_NE_K + 1) + k0], u_qs, sc,
                     x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K], &y_df[j*MMQ_TILE_Y_K + k01/QI8_1]);
             }
         }
